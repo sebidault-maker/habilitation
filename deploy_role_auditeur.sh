@@ -1,133 +1,175 @@
 #!/usr/bin/env bash
-# =============================================================================
-#  deploy_role_auditeur.sh — Ajoute le rôle "Auditeur (lecture seule)" à
-#  l'application principale (page de connexion + comptes) de gmp.scientianatura.com
+# =====================================================================
+# deploy_role_auditeur.sh  —  Laboratoires Scientia Natura (GMP)
+# Ajoute le profil « auditeur » (lecture seule) aux registres CAPA et
+# auto-inspections, en miroir de cc.py / nc.py / eval.py.
 #
-#  Effet :
-#   - app.py : nouveau rôle `auditeur` (rang lecture = Qualité) + filet global
-#     dans gate() -> 403 sur TOUTE écriture (POST/PUT/DELETE) pour ce rôle,
-#     sauf login / logout / change-password. _can_edit_planning -> False.
-#   - index.html : option "Auditeur (lecture seule)" dans les menus de rôle
-#     (création + modification de compte).
+# Sûr & relançable :
+#   - sauvegarde horodatée de chaque fichier touché (*.AAAAMMJJ-HHMMSS.bak)
+#   - vérification que chaque fichier compile ; restauration auto si échec
+#   - idempotent : un 2e passage détecte « déjà patché » et ne refait rien
+#   - reconstruit ensuite le conteneur (docker compose up -d --build)
 #
-#  Idempotent (relançable). Sauvegardes horodatées + restauration auto si échec.
-#  Usage :  bash deploy_role_auditeur.sh
-# =============================================================================
+# NE TOUCHE NI .env NI *.db. Aucun secret n'est écrit par ce script.
+# =====================================================================
 set -euo pipefail
 cd /opt/registre-gmp
 
-TS="$(date +%Y%m%d-%H%M%S)"
-FILES="app.py index.html"
+echo "== Déploiement : profil auditeur lecture seule (capa.py + inspection.py) =="
 
-echo "===================================================================="
-echo " Rôle AUDITEUR (lecture seule) — application principale  —  $TS"
-echo "===================================================================="
-
-for f in $FILES; do
-  [ -f "$f" ] || { echo "!! Fichier manquant : $f — abandon."; exit 1; }
+for f in capa.py inspection.py docker-compose.yml; do
+  [ -f "$f" ] || { echo "ERREUR : $f introuvable dans $(pwd)." >&2; exit 1; }
 done
 
-echo "-- Sauvegardes :"
-for f in $FILES; do cp "$f" "$f.$TS.bak"; echo "   $f.$TS.bak"; done
+# ── Patch Python (sauvegarde + compile-check + restauration intégrés) ──
+python3 - <<'PYEOF'
+import os, sys, shutil, datetime, py_compile
+STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
-restore() {
-  echo "!! Restauration des sauvegardes…"
-  for f in $FILES; do [ -f "$f.$TS.bak" ] && cp "$f.$TS.bak" "$f"; done
-}
+def apply_repls(path, repls, marker="AUDITEUR_PASSWORD"):
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    if marker in src:
+        print("  %-16s : déjà patché — ignoré." % path); return False
+    for old, new in repls:
+        n = src.count(old)
+        if n != 1:
+            print("  ERREUR %s : motif présent %d fois (attendu 1) :\n    %r"
+                  % (path, n, old[:70])); sys.exit(2)
+        src = src.replace(old, new, 1)
+    bak = "%s.%s.bak" % (path, STAMP)
+    shutil.copy2(path, bak)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(src)
+    try:
+        py_compile.compile(path, doraise=True)
+    except py_compile.PyCompileError as e:
+        shutil.copy2(bak, path)
+        print("  ERREUR de compilation sur %s — restauré depuis %s.\n%s"
+              % (path, os.path.basename(bak), e)); sys.exit(3)
+    print("  %-16s : patché OK (sauvegarde %s)" % (path, os.path.basename(bak)))
+    return True
 
-echo "-- Application des correctifs :"
-if python3 - <<'PYEOF'
-import sys
-FAIL=[]
+CAPA = [
+ ('CAPA_PW = os.environ.get("CAPA_PASSWORD", "")\n',
+  'CAPA_PW = os.environ.get("CAPA_PASSWORD", "")\n'
+  'AUDITEUR = os.environ.get("AUDITEUR_PASSWORD", "")  # lecture seule (profil auditeur)\n'),
+ ('''def require_qualite(fn):
+    @wraps(fn)
+    def w(*a, **k):
+        if not CAPA_PW:
+            return jsonify({"error": "CAPA_PASSWORD n'est pas défini sur le serveur."}), 503
+        if request.headers.get("X-Capa-Password", "") != CAPA_PW:
+            return jsonify({"error": "Accès réservé à la Qualité et à l'admin."}), 401
+        return fn(*a, **k)
+    return w
+''',
+  '''def _role():
+    h = request.headers.get("X-Capa-Password", "")
+    if CAPA_PW and h == CAPA_PW:
+        return "qualite"
+    if AUDITEUR and h == AUDITEUR:
+        return "auditeur"
+    return None
 
-def patch_app(fn):
-    s=open(fn,encoding="utf-8").read()
-    if "AUDITEUR_WRITE_WHITELIST" in s:
-        print("   = app.py déjà patché, ignoré"); return
-    if 'ROLES = ("operator", "quality", "admin")' not in s:
-        FAIL.append("app.py : ligne ROLES introuvable"); return
-    s=s.replace('ROLES = ("operator", "quality", "admin")',
-                'ROLES = ("operator", "quality", "admin", "auditeur")',1)
-    s=s.replace('ROLE_RANK = {"operator": 1, "quality": 2, "admin": 3}',
-                'ROLE_RANK = {"operator": 1, "quality": 2, "admin": 3, "auditeur": 2}',1)
-    s=s.replace('ROLE_LABELS = {"operator": "Opérateur", "quality": "Qualité", "admin": "Administrateur"}',
-                'ROLE_LABELS = {"operator": "Opérateur", "quality": "Qualité", "admin": "Administrateur", "auditeur": "Auditeur (lecture seule)"}',1)
-    s=s.replace('PUBLIC_PATHS = {"/", "/health", "/api/login", "/api/me", "/api/logout"}',
-                'PUBLIC_PATHS = {"/", "/health", "/api/login", "/api/me", "/api/logout"}\n'
-                '# Profil auditeur : lecture seule. Seules ces routes d\'ecriture lui restent permises.\n'
-                'AUDITEUR_WRITE_WHITELIST = {"/api/change-password", "/api/logout"}',1)
-    anchor=('    if p in PUBLIC_PATHS or not p.startswith("/api/"):\n'
-            '        return\n'
-            '    if not session.get("uid"):\n'
-            '        return jsonify(error="Authentification requise."), 401')
-    if anchor not in s:
-        FAIL.append("app.py : gate() introuvable"); return
-    s=s.replace(anchor, anchor+
-        ('\n    if session.get("role") == "auditeur" and request.method in ("POST", "PUT", "DELETE", "PATCH") \\\n'
-         '            and p not in AUDITEUR_WRITE_WHITELIST:\n'
-         '        return jsonify(error="Profil auditeur : consultation seule, aucune modification autorisee."), 403'),1)
-    anchor2=('    Si pkey est None : renvoie True si la personne peut éditer au moins un planning."""\n'
-             '    if session.get("role") == "admin":')
-    if anchor2 not in s:
-        FAIL.append("app.py : _can_edit_planning introuvable"); return
-    s=s.replace(anchor2,
-        ('    Si pkey est None : renvoie True si la personne peut éditer au moins un planning."""\n'
-         '    if session.get("role") == "auditeur":\n'
-         '        return False\n'
-         '    if session.get("role") == "admin":'),1)
-    for needle in ['"auditeur": 2','AUDITEUR_WRITE_WHITELIST','consultation seule, aucune modification']:
-        if needle not in s: FAIL.append("app.py : post-verif manque "+needle); return
-    open(fn,"w",encoding="utf-8").write(s); print("   \u2713 app.py")
 
-def patch_html(fn):
-    s=open(fn,encoding="utf-8").read()
-    if 'auditeur:"Auditeur (lecture seule)"' in s:
-        print("   = index.html déjà patché, ignoré"); return
-    if 'const ROLE_LABELS = {operator:"Opérateur", quality:"Qualité", admin:"Administrateur"};' not in s:
-        FAIL.append("index.html : ROLE_LABELS introuvable"); return
-    s=s.replace('const ROLE_LABELS = {operator:"Opérateur", quality:"Qualité", admin:"Administrateur"};',
-                'const ROLE_LABELS = {operator:"Opérateur", quality:"Qualité", admin:"Administrateur", auditeur:"Auditeur (lecture seule)"};',1)
-    a_create="+ '<option value=\"admin\">Administrateur (gère les comptes)</option></select></div>'"
-    if a_create not in s:
-        FAIL.append("index.html : menu création introuvable"); return
-    s=s.replace(a_create,
-                "+ '<option value=\"admin\">Administrateur (gère les comptes)</option>'\n"
-                "    + '<option value=\"auditeur\">Auditeur (lecture seule)</option></select></div>'",1)
-    a_edit="+ ['operator','quality','admin'].map(r => '<option value=\"'+r+'\"'"
-    if a_edit not in s:
-        FAIL.append("index.html : menu édition introuvable"); return
-    s=s.replace(a_edit,"+ ['operator','quality','admin','auditeur'].map(r => '<option value=\"'+r+'\"'",1)
-    for needle in ['auditeur:"Auditeur (lecture seule)"','value="auditeur">Auditeur (lecture seule)',
-                   "['operator','quality','admin','auditeur']"]:
-        if needle not in s: FAIL.append("index.html : post-verif manque "+needle); return
-    open(fn,"w",encoding="utf-8").write(s); print("   \u2713 index.html")
+def require_qualite(fn):
+    @wraps(fn)
+    def w(*a, **k):
+        if not CAPA_PW:
+            return jsonify({"error": "CAPA_PASSWORD n'est pas défini sur le serveur."}), 503
+        if _role() is None:
+            return jsonify({"error": "Accès réservé à la Qualité, à l'admin et aux auditeurs."}), 401
+        return fn(*a, **k)
+    return w
 
-patch_app("app.py")
-patch_html("index.html")
-if FAIL:
-    print("\n!! ÉCHEC :")
-    for x in FAIL: print("   -",x)
-    sys.exit(3)
-print("-- Correctifs appliqués.")
+
+def require_write(fn):
+    @wraps(fn)
+    def w(*a, **k):
+        if _role() != "qualite":
+            return jsonify({"error": "Profil auditeur : consultation seule, modification non autorisée."}), 403
+        return fn(*a, **k)
+    return w
+'''),
+ ('@bp.route("/api/capa/check", methods=["POST"])\n@require_qualite\ndef check():\n    return jsonify({"ok": True})\n',
+  '@bp.route("/api/capa/check", methods=["POST"])\n@require_qualite\ndef check():\n    return jsonify({"ok": True, "role": _role()})\n'),
+ ('@require_qualite\ndef creer():\n',     '@require_qualite\n@require_write\ndef creer():\n'),
+ ('@require_qualite\ndef modifier(cid):\n', '@require_qualite\n@require_write\ndef modifier(cid):\n'),
+ ('@require_qualite\ndef suivi(cid):\n',  '@require_qualite\n@require_write\ndef suivi(cid):\n'),
+ ('@require_qualite\ndef cloturer(cid):\n', '@require_qualite\n@require_write\ndef cloturer(cid):\n'),
+ ('@require_qualite\ndef annuler(cid):\n', '@require_qualite\n@require_write\ndef annuler(cid):\n'),
+]
+
+INSP = [
+ ('INSP_PW = os.environ.get("INSPECTION_PASSWORD", "") or os.environ.get("CAPA_PASSWORD", "")\n',
+  'INSP_PW = os.environ.get("INSPECTION_PASSWORD", "") or os.environ.get("CAPA_PASSWORD", "")\n'
+  'AUDITEUR = os.environ.get("AUDITEUR_PASSWORD", "")  # lecture seule (profil auditeur)\n'),
+ ('''def require_qualite(fn):
+    @wraps(fn)
+    def w(*a, **k):
+        if not INSP_PW:
+            return jsonify({"error": "INSPECTION_PASSWORD (ou CAPA_PASSWORD) non défini sur le serveur."}), 503
+        if request.headers.get("X-Inspection-Password", "") != INSP_PW:
+            return jsonify({"error": "Accès réservé à la Qualité et à l'admin."}), 401
+        return fn(*a, **k)
+    return w
+''',
+  '''def _role():
+    h = request.headers.get("X-Inspection-Password", "")
+    if INSP_PW and h == INSP_PW:
+        return "qualite"
+    if AUDITEUR and h == AUDITEUR:
+        return "auditeur"
+    return None
+
+
+def require_qualite(fn):
+    @wraps(fn)
+    def w(*a, **k):
+        if not INSP_PW:
+            return jsonify({"error": "INSPECTION_PASSWORD (ou CAPA_PASSWORD) non défini sur le serveur."}), 503
+        if _role() is None:
+            return jsonify({"error": "Accès réservé à la Qualité, à l'admin et aux auditeurs."}), 401
+        return fn(*a, **k)
+    return w
+
+
+def require_write(fn):
+    @wraps(fn)
+    def w(*a, **k):
+        if _role() != "qualite":
+            return jsonify({"error": "Profil auditeur : consultation seule, modification non autorisée."}), 403
+        return fn(*a, **k)
+    return w
+'''),
+ ('@bp.route("/api/inspection/check", methods=["POST"])\n@require_qualite\ndef check():\n    return jsonify({"ok": True})\n',
+  '@bp.route("/api/inspection/check", methods=["POST"])\n@require_qualite\ndef check():\n    return jsonify({"ok": True, "role": _role()})\n'),
+ ('@require_qualite\ndef creer():\n',     '@require_qualite\n@require_write\ndef creer():\n'),
+ ('@require_qualite\ndef maj(iid):\n',    '@require_qualite\n@require_write\ndef maj(iid):\n'),
+ ('@require_qualite\ndef note(iid):\n',   '@require_qualite\n@require_write\ndef note(iid):\n'),
+ ('@require_qualite\ndef cloturer(iid):\n', '@require_qualite\n@require_write\ndef cloturer(iid):\n'),
+ ('@require_qualite\ndef annuler(iid):\n', '@require_qualite\n@require_write\ndef annuler(iid):\n'),
+]
+
+print("Patch « profil auditeur lecture seule » :")
+apply_repls("capa.py", CAPA)
+apply_repls("inspection.py", INSP)
+print("Patch terminé.")
 PYEOF
-then :; else echo "!! Patch interrompu."; restore; exit 1; fi
 
-echo "-- Vérification syntaxe app.py :"
-if ! python3 -c "import ast; ast.parse(open('app.py').read())" 2>/dev/null; then
-  echo "!! app.py ne compile pas — restauration."; restore; exit 1
+# ── Rappel .env (le script n'écrit AUCUN secret) ──
+if [ -f .env ] && grep -q '^AUDITEUR_PASSWORD=' .env; then
+  echo "✓ AUDITEUR_PASSWORD est présent dans .env."
+else
+  echo "⚠  AUDITEUR_PASSWORD est ABSENT de .env."
+  echo "   Tant qu'il n'est pas défini, l'auditeur n'aura accès ni à CAPA ni aux auto-inspections."
+  echo "   Ajoute une ligne dans .env (remplace par le mot de passe auditeur) :"
+  echo "       AUDITEUR_PASSWORD=********"
 fi
-echo "   app.py OK."
 
-echo "-- Reconstruction du conteneur…"
+# ── Reconstruction du conteneur ──
+echo "== Reconstruction du conteneur (docker compose up -d --build) =="
 docker compose up -d --build
 
-echo "===================================================================="
-echo " Rôle AUDITEUR déployé."
-echo "   Crée maintenant le compte auditeur : onglet Comptes -> Nouveau compte"
-echo "      Rôle = « Auditeur (lecture seule) »"
-echo "      Identifiant : auditeur   Nom : Bernard PLAU (FACOPHAR)"
-echo "      Mot de passe temporaire : (au choix, 8+ car.)"
-echo "   L'auditeur entre sur la plateforme, voit déviations / qualité / procédures,"
-echo "   et reçoit 403 sur toute modification."
-echo "   Restauration : cp app.py.$TS.bak app.py ; cp index.html.$TS.bak index.html ; docker compose up -d --build"
-echo "===================================================================="
+echo "✓ deploy_role_auditeur.sh terminé."
