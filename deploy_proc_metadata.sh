@@ -165,8 +165,8 @@ function editProc(r){
   });
 }'''),
 
- ("""fmtSize(r.size):'')+'</span></div>'""",
-  """fmtSize(r.size):'')+'</span><br><span class="muted" style="font-size:.85em">R&eacute;d. '+esc(r.redacteur||"-")+' &middot; V&eacute;rif. '+esc(r.verificateur||"-")+' &middot; Appr. '+esc(r.approbateur||"-")+(r.dateApplication?' &middot; Application : '+esc(r.dateApplication):'')+'</span></div>'"""),
+ ("""chip+' <span class="muted">'+esc(r.origName)+(r.size?' \u00b7 '+fmtSize(r.size):'')+'</span></div>'""",
+  """chip+' <span class="muted">'+esc(r.origName)+(r.size?' \u00b7 '+fmtSize(r.size):'')+'</span><br><span class="muted" style="font-size:.85em">R&eacute;d. '+esc(r.redacteur||"-")+' &middot; V&eacute;rif. '+esc(r.verificateur||"-")+' &middot; Appr. '+esc(r.approbateur||"-")+(r.dateApplication?' &middot; Application : '+esc(r.dateApplication):'')+'</span></div>'"""),
 ]
 
 
